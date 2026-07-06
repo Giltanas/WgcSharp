@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -34,15 +35,27 @@ internal static class DxgiBackend
         public uint dwFlags;
     }
 
-    public static Bitmap? Capture(IntPtr hwnd, int timeoutMs)
+    public static Bitmap? Capture(IntPtr hwnd, int timeoutMs, ILogger log)
     {
+        log.LogDebug("DXGI: getting window rect for hwnd=0x{Hwnd:X}", hwnd);
         if (!GetWindowScreenRect(hwnd, out var windowRect))
+        {
+            log.LogWarning("DXGI: failed to get window rect");
             return null;
+        }
+        log.LogDebug("DXGI: window rect L={L} T={T} R={R} B={B}",
+            windowRect.Left, windowRect.Top, windowRect.Right, windowRect.Bottom);
 
         var hMonitor = MonitorFromWindow(hwnd, 2);
         var monitorInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
         if (!GetMonitorInfo(hMonitor, ref monitorInfo))
+        {
+            log.LogWarning("DXGI: failed to get monitor info");
             return null;
+        }
+        log.LogDebug("DXGI: monitor rect L={L} T={T} R={R} B={B}",
+            monitorInfo.rcMonitor.Left, monitorInfo.rcMonitor.Top,
+            monitorInfo.rcMonitor.Right, monitorInfo.rcMonitor.Bottom);
 
         D3D11.D3D11CreateDevice(
             IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
@@ -55,15 +68,21 @@ internal static class DxgiBackend
         using var adapter = dxgiDevice.GetAdapter();
 
         var output = FindOutputForMonitor(adapter, monitorInfo.rcMonitor);
-        if (output == null) return null;
+        if (output == null)
+        {
+            log.LogWarning("DXGI: no output found for monitor");
+            return null;
+        }
 
         using var _out = output;
         using var output1 = output.QueryInterface<IDXGIOutput1>();
+        log.LogDebug("DXGI: duplicating output");
         using var duplication = output1.DuplicateOutput(d3dDevice);
 
         var result = duplication.AcquireNextFrame((uint)timeoutMs, out _, out var desktopResource);
         if (result.Failure)
         {
+            log.LogWarning("DXGI: AcquireNextFrame failed, hr=0x{HR:X8}", result.Code);
             desktopResource?.Dispose();
             return null;
         }
@@ -71,6 +90,7 @@ internal static class DxgiBackend
         try
         {
             using var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
+            log.LogDebug("DXGI: frame acquired, cropping to window rect");
             return CropFrameToBitmap(frameTexture, d3dDevice, d3dContext, windowRect, monitorInfo.rcMonitor);
         }
         finally

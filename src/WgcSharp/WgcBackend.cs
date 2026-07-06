@@ -3,16 +3,16 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Microsoft.Extensions.Logging;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
-using Windows.Graphics.Capture;
-using Windows.Graphics.DirectX;
-using Windows.Graphics.DirectX.Direct3D11;
-using WinRT;
 
 namespace WgcSharp;
 
+/// <summary>
+/// WGC capture using raw vtable calls — no CsWinRT, no QI, no ComWrappers conflicts.
+/// </summary>
 internal static class WgcBackend
 {
     [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice", PreserveSig = false)]
@@ -42,8 +42,101 @@ internal static class WgcBackend
         IntPtr GetInterface([In] ref Guid iid);
     }
 
-    public static Bitmap? Capture(IntPtr hwnd, int timeoutMs)
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SizeInt32
     {
+        public int Width;
+        public int Height;
+    }
+
+    // ─── WinRT vtable slot indices ───────────────────────────────────────────
+    // IUnknown: 0=QI, 1=AddRef, 2=Release
+    // IInspectable: 3=GetIids, 4=GetRuntimeClassName, 5=GetTrustLevel
+    // Interface methods start at slot 6
+
+    // IGraphicsCaptureItem: slot 6=get_DisplayName, 7=get_Size
+    // IDirect3D11CaptureFramePoolStatics2: slot 6=CreateFreeThreaded
+    // IDirect3D11CaptureFramePool: slot 6=Recreate, 7=TryGetNextFrame, 8=add_FrameArrived, 9=remove_FrameArrived, 10=CreateCaptureSession
+    // IGraphicsCaptureSession: slot 6=StartCapture
+    // IGraphicsCaptureSession3: slot 6=get_IsBorderRequired, 7=put_IsBorderRequired
+    // IDirect3D11CaptureFrame: slot 6=get_Surface, 7=get_SystemRelativeTime, 8=get_ContentSize
+
+    // ─── Vtable call delegates ───────────────────────────────────────────────
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtGetSizeDelegate(IntPtr thisPtr, out SizeInt32 size);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtCreateFreeThreadedDelegate(IntPtr thisPtr, IntPtr device, int pixelFormat, int numberOfBuffers, SizeInt32 size, out IntPtr result);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtTryGetNextFrameDelegate(IntPtr thisPtr, out IntPtr frame);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtCreateCaptureSessionDelegate(IntPtr thisPtr, IntPtr item, out IntPtr session);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtStartCaptureDelegate(IntPtr thisPtr);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtPutBoolDelegate(IntPtr thisPtr, byte value);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtGetSurfaceDelegate(IntPtr thisPtr, out IntPtr surface);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtGetContentSizeDelegate(IntPtr thisPtr, out SizeInt32 size);
+
+    private static IntPtr GetVtableSlot(IntPtr comPtr, int slot)
+    {
+        var vtable = Marshal.ReadIntPtr(comPtr);
+        return Marshal.ReadIntPtr(vtable, slot * IntPtr.Size);
+    }
+
+    private static TDelegate GetVtMethod<TDelegate>(IntPtr comPtr, int slot) where TDelegate : Delegate
+    {
+        return Marshal.GetDelegateForFunctionPointer<TDelegate>(GetVtableSlot(comPtr, slot));
+    }
+
+    // IUnknown QI helper
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int QIDelegate(IntPtr thisPtr, ref Guid iid, out IntPtr ppv);
+
+    private static IntPtr ComQI(IntPtr comPtr, Guid iid)
+    {
+        var qi = GetVtMethod<QIDelegate>(comPtr, 0);
+        int hr = qi(comPtr, ref iid, out var result);
+        Marshal.ThrowExceptionForHR(hr);
+        return result;
+    }
+
+    // IUnknown Release helper
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate uint ReleaseDelegate(IntPtr thisPtr);
+
+    private static void ComRelease(IntPtr comPtr)
+    {
+        if (comPtr != IntPtr.Zero)
+        {
+            var release = GetVtMethod<ReleaseDelegate>(comPtr, 2);
+            release(comPtr);
+        }
+    }
+
+    // ─── GUIDs ───────────────────────────────────────────────────────────────
+
+    private static readonly Guid IID_IGraphicsCaptureItem = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+    private static readonly Guid IID_IDirect3D11CaptureFramePool = new("24EB6D22-1975-4106-A4AE-7D6F77C42003");
+    private static readonly Guid IID_IDirect3D11CaptureFramePoolStatics2 = new("589B103F-6BBC-5DF5-A991-02E28B3B66D5");
+    private static readonly Guid IID_IGraphicsCaptureSession = new("814E42A9-F70F-4AD7-939B-FDDCC6EB880D");
+    private static readonly Guid IID_IGraphicsCaptureSession3 = new("F2CDD966-22AE-5EA1-9596-3A289344C3BE");
+    private static readonly Guid IID_IDirect3D11CaptureFrame = new("FA50C623-38DA-4B32-ACF3-FA9734AD800E");
+
+    // ─── Capture ─────────────────────────────────────────────────────────────
+
+    public static Bitmap? Capture(IntPtr hwnd, int timeoutMs, ILogger log)
+    {
+        log.LogDebug("WGC: creating D3D11 device");
         D3D11.D3D11CreateDevice(
             IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
             null!, out var d3dDevice, out var d3dContext).CheckError();
@@ -52,54 +145,114 @@ internal static class WgcBackend
         using var _ctx = d3dContext;
 
         using var dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>();
-        CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out var inspectable);
-        var winrtDevice = MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
-        Marshal.Release(inspectable);
+        CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out var devicePtr);
+        log.LogDebug("WGC: WinRT device ptr=0x{Ptr:X}", devicePtr);
 
-        var item = CreateCaptureItemForWindow(hwnd);
+        // Create capture item — returned pointer IS IGraphicsCaptureItem (default interface)
+        var itemPtr = CreateCaptureItemForWindow(hwnd, log);
+
+        // get_Size is slot 7 on IGraphicsCaptureItem
+        var getSize = GetVtMethod<VtGetSizeDelegate>(itemPtr, 7);
+        Marshal.ThrowExceptionForHR(getSize(itemPtr, out var size));
+        log.LogDebug("WGC: item size={W}x{H}", size.Width, size.Height);
+
+        if (size.Width == 0 || size.Height == 0)
+        {
+            log.LogWarning("WGC: zero size, aborting");
+            ComRelease(itemPtr);
+            ComRelease(devicePtr);
+            return null;
+        }
+
+        // Create free-threaded frame pool — returned pointer IS IDirect3D11CaptureFramePool
+        var poolPtr = CreateFreeThreadedPool(devicePtr, size, log);
+
+        // CreateCaptureSession is slot 10 on IDirect3D11CaptureFramePool
+        var createSession = GetVtMethod<VtCreateCaptureSessionDelegate>(poolPtr, 10);
+        Marshal.ThrowExceptionForHR(createSession(poolPtr, itemPtr, out var sessionPtr));
+        log.LogDebug("WGC: session created");
+
+        // Try disable border via IGraphicsCaptureSession3 (QI needed — different interface)
+        try
+        {
+            var session3 = ComQI(sessionPtr, IID_IGraphicsCaptureSession3);
+            var putBorder = GetVtMethod<VtPutBoolDelegate>(session3, 7);
+            putBorder(session3, 0);
+            ComRelease(session3);
+            log.LogDebug("WGC: border disabled");
+        }
+        catch
+        {
+            log.LogDebug("WGC: border disable not supported");
+        }
+
+        // StartCapture is slot 6 on IGraphicsCaptureSession (default interface of session)
+        var startCapture = GetVtMethod<VtStartCaptureDelegate>(sessionPtr, 6);
+        Marshal.ThrowExceptionForHR(startCapture(sessionPtr));
+        log.LogDebug("WGC: capture started, polling for frames");
 
         Bitmap? result = null;
         Exception? capturedException = null;
-        using var frameReady = new ManualResetEventSlim(false);
+        int frameCount = 0;
 
-        var pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-            winrtDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 1, item.Size);
+        // TryGetNextFrame is slot 7 on IDirect3D11CaptureFramePool
+        var tryGetNextFrame = GetVtMethod<VtTryGetNextFrameDelegate>(poolPtr, 7);
 
-        var session = pool.CreateCaptureSession(item);
-        try
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
         {
-            var borderProp = session.GetType().GetProperty("IsBorderRequired");
-            borderProp?.SetValue(session, false);
-        }
-        catch { }
+            int hr = tryGetNextFrame(poolPtr, out var framePtr);
+            if (hr < 0 || framePtr == IntPtr.Zero)
+            {
+                Thread.Sleep(16);
+                continue;
+            }
 
-        pool.FrameArrived += (sender, _) =>
-        {
-            if (frameReady.IsSet) return;
-            var frame = sender.TryGetNextFrame();
-            if (frame == null) return;
+            frameCount++;
+
+            // framePtr IS IDirect3D11CaptureFrame (default interface)
+            // get_ContentSize is slot 8
+            var getContentSize = GetVtMethod<VtGetContentSizeDelegate>(framePtr, 8);
+            getContentSize(framePtr, out var contentSize);
+            log.LogDebug("WGC: frame #{N} size={W}x{H}", frameCount, contentSize.Width, contentSize.Height);
+
+            if (frameCount <= 1)
+            {
+                log.LogDebug("WGC: skipping first frame");
+                ComRelease(framePtr);
+                Thread.Sleep(50);
+                continue;
+            }
 
             try
             {
-                result = FrameToBitmap(frame, d3dDevice, d3dContext);
+                // get_Surface is slot 6 on IDirect3D11CaptureFrame
+                var getSurface = GetVtMethod<VtGetSurfaceDelegate>(framePtr, 6);
+                Marshal.ThrowExceptionForHR(getSurface(framePtr, out var surfacePtr));
+                result = SurfaceToBitmap(surfacePtr, d3dDevice, d3dContext, log);
+                ComRelease(surfacePtr);
+                log.LogDebug("WGC: bitmap {W}x{H}", result.Width, result.Height);
             }
             catch (Exception ex)
             {
+                log.LogError(ex, "WGC: SurfaceToBitmap failed");
                 capturedException = ex;
             }
             finally
             {
-                SafeDispose(frame);
-                frameReady.Set();
+                ComRelease(framePtr);
             }
-        };
+            break;
+        }
 
-        session.StartCapture();
-        frameReady.Wait(timeoutMs);
+        if (frameCount == 0)
+            log.LogWarning("WGC: no frames within timeout");
 
-        SafeDispose(session);
-        SafeDispose(pool);
-        SafeDispose(winrtDevice);
+        // Cleanup
+        ComRelease(sessionPtr);
+        ComRelease(poolPtr);
+        ComRelease(itemPtr);
+        ComRelease(devicePtr);
 
         if (capturedException != null)
             throw new InvalidOperationException("WGC frame processing failed.", capturedException);
@@ -107,24 +260,24 @@ internal static class WgcBackend
         return result;
     }
 
-    private static GraphicsCaptureItem CreateCaptureItemForWindow(IntPtr hwnd)
+    private static IntPtr CreateCaptureItemForWindow(IntPtr hwnd, ILogger log)
     {
         const string className = "Windows.Graphics.Capture.GraphicsCaptureItem";
         Marshal.ThrowExceptionForHR(WindowsCreateString(className, className.Length, out var hstring));
         try
         {
             var interopGuid = typeof(IGraphicsCaptureItemInterop).GUID;
-            Marshal.ThrowExceptionForHR(RoGetActivationFactory(hstring, ref interopGuid, out var factoryPtr));
+            int hr = RoGetActivationFactory(hstring, ref interopGuid, out var factoryPtr);
+            log.LogDebug("WGC: activation factory hr=0x{HR:X8}", hr);
+            Marshal.ThrowExceptionForHR(hr);
 
             var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
             Marshal.Release(factoryPtr);
 
-            var itemGuid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+            var itemGuid = IID_IGraphicsCaptureItem;
             interop.CreateForWindow(hwnd, ref itemGuid, out var rawItem);
-
-            var item = MarshalInterface<GraphicsCaptureItem>.FromAbi(rawItem);
-            Marshal.Release(rawItem);
-            return item;
+            log.LogDebug("WGC: CreateForWindow OK, ptr=0x{Ptr:X}", rawItem);
+            return rawItem;
         }
         finally
         {
@@ -132,78 +285,84 @@ internal static class WgcBackend
         }
     }
 
-    private static unsafe Bitmap FrameToBitmap(
-        Direct3D11CaptureFrame frame, ID3D11Device device, ID3D11DeviceContext context)
+    private static IntPtr CreateFreeThreadedPool(IntPtr devicePtr, SizeInt32 size, ILogger log)
     {
-        var surfacePtr = MarshalInspectable<IDirect3DSurface>.FromManaged(frame.Surface);
+        const string className = "Windows.Graphics.Capture.Direct3D11CaptureFramePool";
+        Marshal.ThrowExceptionForHR(WindowsCreateString(className, className.Length, out var hstring));
         try
         {
-            var accessGuid = typeof(IDirect3DDxgiInterfaceAccess).GUID;
-            Marshal.ThrowExceptionForHR(
-                Marshal.QueryInterface(surfacePtr, in accessGuid, out var accessPtr));
+            var staticsGuid = IID_IDirect3D11CaptureFramePoolStatics2;
+            int hr = RoGetActivationFactory(hstring, ref staticsGuid, out var factoryPtr);
+            log.LogDebug("WGC: pool statics hr=0x{HR:X8}", hr);
+            Marshal.ThrowExceptionForHR(hr);
 
-            var access = (IDirect3DDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(accessPtr);
-            Marshal.Release(accessPtr);
-
-            var texGuid = typeof(ID3D11Texture2D).GUID;
-            var texPtr = access.GetInterface(ref texGuid);
-
-            using var frameTexture = new ID3D11Texture2D(texPtr);
-            var desc = frameTexture.Description;
-
-            var stagingDesc = new Texture2DDescription
-            {
-                Width = desc.Width, Height = desc.Height,
-                MipLevels = 1, ArraySize = 1, Format = desc.Format,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Staging, BindFlags = BindFlags.None,
-                CPUAccessFlags = CpuAccessFlags.Read, MiscFlags = ResourceOptionFlags.None
-            };
-
-            using var staging = device.CreateTexture2D(stagingDesc);
-            context.CopyResource(staging, frameTexture);
-
-            var mapped = context.Map(staging, 0, MapMode.Read);
-            try
-            {
-                var bitmap = new Bitmap((int)desc.Width, (int)desc.Height, PixelFormat.Format32bppArgb);
-                var bmpData = bitmap.LockBits(
-                    new Rectangle(0, 0, bitmap.Width, bitmap.Height),
-                    ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-
-                for (int y = 0; y < bitmap.Height; y++)
-                {
-                    Buffer.MemoryCopy(
-                        (void*)(mapped.DataPointer + y * mapped.RowPitch),
-                        (void*)(bmpData.Scan0 + y * bmpData.Stride),
-                        bmpData.Stride, bitmap.Width * 4);
-                }
-
-                bitmap.UnlockBits(bmpData);
-                return bitmap;
-            }
-            finally
-            {
-                context.Unmap(staging, 0);
-            }
+            // CreateFreeThreaded is slot 6 on IDirect3D11CaptureFramePoolStatics2
+            var createFreeThreaded = GetVtMethod<VtCreateFreeThreadedDelegate>(factoryPtr, 6);
+            // B8G8R8A8UIntNormalized = 87
+            hr = createFreeThreaded(factoryPtr, devicePtr, 87, 2, size, out var poolPtr);
+            ComRelease(factoryPtr);
+            log.LogDebug("WGC: CreateFreeThreaded hr=0x{HR:X8}, pool=0x{Ptr:X}", hr, poolPtr);
+            Marshal.ThrowExceptionForHR(hr);
+            return poolPtr;
         }
         finally
         {
-            Marshal.Release(surfacePtr);
+            WindowsDeleteString(hstring);
         }
     }
 
-    private static void SafeDispose(object? obj)
+    private static unsafe Bitmap SurfaceToBitmap(
+        IntPtr surfacePtr, ID3D11Device device, ID3D11DeviceContext context, ILogger log)
     {
-        if (obj == null) return;
+        var accessGuid = typeof(IDirect3DDxgiInterfaceAccess).GUID;
+        int hr = Marshal.QueryInterface(surfacePtr, in accessGuid, out var accessPtr);
+        log.LogDebug("WGC: QI DxgiAccess hr=0x{HR:X8}", hr);
+        Marshal.ThrowExceptionForHR(hr);
+
+        var access = (IDirect3DDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(accessPtr);
+        Marshal.Release(accessPtr);
+
+        var texGuid = typeof(ID3D11Texture2D).GUID;
+        var texPtr = access.GetInterface(ref texGuid);
+
+        using var frameTexture = new ID3D11Texture2D(texPtr);
+        var desc = frameTexture.Description;
+        log.LogDebug("WGC: texture {W}x{H} fmt={F}", desc.Width, desc.Height, desc.Format);
+
+        var stagingDesc = new Texture2DDescription
+        {
+            Width = desc.Width, Height = desc.Height,
+            MipLevels = 1, ArraySize = 1, Format = desc.Format,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging, BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read, MiscFlags = ResourceOptionFlags.None
+        };
+
+        using var staging = device.CreateTexture2D(stagingDesc);
+        context.CopyResource(staging, frameTexture);
+
+        var mapped = context.Map(staging, 0, MapMode.Read);
         try
         {
-            if (obj is IDisposable disposable)
-                disposable.Dispose();
+            var bitmap = new Bitmap((int)desc.Width, (int)desc.Height, PixelFormat.Format32bppArgb);
+            var bmpData = bitmap.LockBits(
+                new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+                ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+
+            for (int y = 0; y < bitmap.Height; y++)
+            {
+                Buffer.MemoryCopy(
+                    (void*)(mapped.DataPointer + y * mapped.RowPitch),
+                    (void*)(bmpData.Scan0 + y * bmpData.Stride),
+                    bmpData.Stride, bitmap.Width * 4);
+            }
+
+            bitmap.UnlockBits(bmpData);
+            return bitmap;
         }
-        catch (InvalidCastException)
+        finally
         {
-            try { Marshal.FinalReleaseComObject(obj); } catch { }
+            context.Unmap(staging, 0);
         }
     }
 }
