@@ -22,9 +22,15 @@ jobs:
 
       - run: dotnet pack src/WgcSharp/WgcSharp.csproj -c Release -o ./nupkg
 
+      - name: NuGet login
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: Giltanas
+
       - name: Push to NuGet
         shell: pwsh
         run: |
           Get-ChildItem ./nupkg/*.nupkg | ForEach-Object {
-            dotnet nuget push $_.FullName --source https://api.nuget.org/v3/index.json
+            dotnet nuget push $_.FullName --api-key ${{steps.login.outputs.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json
           }
