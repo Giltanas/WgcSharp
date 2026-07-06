@@ -22,4 +22,9 @@ jobs:
 
       - run: dotnet pack src/WgcSharp/WgcSharp.csproj -c Release -o ./nupkg
 
-      - run: dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json
+      - name: Push to NuGet
+        shell: pwsh
+        run: |
+          Get-ChildItem ./nupkg/*.nupkg | ForEach-Object {
+            dotnet nuget push $_.FullName --source https://api.nuget.org/v3/index.json
+          }
