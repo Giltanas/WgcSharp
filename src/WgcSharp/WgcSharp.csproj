@@ -9,7 +9,7 @@
 
         <!-- NuGet package metadata -->
         <PackageId>WgcSharp</PackageId>
-        <Version>1.1.0</Version>
+        <Version>1.1.1</Version>
         <Authors>Giltanas</Authors>
         <Description>Capture any window by HWND — including occluded, minimized, and DirectX/OpenGL game windows. Uses Windows.Graphics.Capture (WGC) with DXGI Desktop Duplication fallback. No CsWinRT headaches.</Description>
         <PackageTags>screen-capture;window-capture;WGC;Windows.Graphics.Capture;DirectX;game-capture;screenshot;HWND;DXGI</PackageTags>

@@ -123,6 +123,33 @@ internal static class WgcBackend
         }
     }
 
+    // IClosable.Close is slot 6 (first method after IInspectable)
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VtCloseDelegate(IntPtr thisPtr);
+
+    /// <summary>
+    /// Closes a WinRT IClosable, then releases the ref. Releasing alone is NOT
+    /// enough for capture objects: the DWM capture pipeline holds its own
+    /// references, so a session that is only Released keeps capturing frames
+    /// and pinning GPU buffers forever. Close() is what actually stops it.
+    /// </summary>
+    private static void ComCloseAndRelease(IntPtr comPtr)
+    {
+        if (comPtr == IntPtr.Zero) return;
+        try
+        {
+            var closable = ComQI(comPtr, IID_IClosable);
+            var close = GetVtMethod<VtCloseDelegate>(closable, 6);
+            close(closable);
+            ComRelease(closable);
+        }
+        catch
+        {
+            // Object doesn't implement IClosable — plain release below is all we can do.
+        }
+        ComRelease(comPtr);
+    }
+
     // ─── GUIDs ───────────────────────────────────────────────────────────────
 
     private static readonly Guid IID_IGraphicsCaptureItem = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
@@ -131,6 +158,7 @@ internal static class WgcBackend
     private static readonly Guid IID_IGraphicsCaptureSession = new("814E42A9-F70F-4AD7-939B-FDDCC6EB880D");
     private static readonly Guid IID_IGraphicsCaptureSession3 = new("F2CDD966-22AE-5EA1-9596-3A289344C3BE");
     private static readonly Guid IID_IDirect3D11CaptureFrame = new("FA50C623-38DA-4B32-ACF3-FA9734AD800E");
+    private static readonly Guid IID_IClosable = new("30D5A829-7FA4-4026-83BB-D75BAE4EA99E");
 
     // ─── Capture ─────────────────────────────────────────────────────────────
 
@@ -148,111 +176,125 @@ internal static class WgcBackend
         CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out var devicePtr);
         log.LogDebug("WGC: WinRT device ptr=0x{Ptr:X}", devicePtr);
 
-        // Create capture item — returned pointer IS IGraphicsCaptureItem (default interface)
-        var itemPtr = CreateCaptureItemForWindow(hwnd, log);
-
-        // get_Size is slot 7 on IGraphicsCaptureItem
-        var getSize = GetVtMethod<VtGetSizeDelegate>(itemPtr, 7);
-        Marshal.ThrowExceptionForHR(getSize(itemPtr, out var size));
-        log.LogDebug("WGC: item size={W}x{H}", size.Width, size.Height);
-
-        if (size.Width == 0 || size.Height == 0)
-        {
-            log.LogWarning("WGC: zero size, aborting");
-            ComRelease(itemPtr);
-            ComRelease(devicePtr);
-            return null;
-        }
-
-        // Create free-threaded frame pool — returned pointer IS IDirect3D11CaptureFramePool
-        var poolPtr = CreateFreeThreadedPool(devicePtr, size, log);
-
-        // CreateCaptureSession is slot 10 on IDirect3D11CaptureFramePool
-        var createSession = GetVtMethod<VtCreateCaptureSessionDelegate>(poolPtr, 10);
-        Marshal.ThrowExceptionForHR(createSession(poolPtr, itemPtr, out var sessionPtr));
-        log.LogDebug("WGC: session created");
-
-        // Try disable border via IGraphicsCaptureSession3 (QI needed — different interface)
-        try
-        {
-            var session3 = ComQI(sessionPtr, IID_IGraphicsCaptureSession3);
-            var putBorder = GetVtMethod<VtPutBoolDelegate>(session3, 7);
-            putBorder(session3, 0);
-            ComRelease(session3);
-            log.LogDebug("WGC: border disabled");
-        }
-        catch
-        {
-            log.LogDebug("WGC: border disable not supported");
-        }
-
-        // StartCapture is slot 6 on IGraphicsCaptureSession (default interface of session)
-        var startCapture = GetVtMethod<VtStartCaptureDelegate>(sessionPtr, 6);
-        Marshal.ThrowExceptionForHR(startCapture(sessionPtr));
-        log.LogDebug("WGC: capture started, polling for frames");
+        var itemPtr = IntPtr.Zero;
+        var poolPtr = IntPtr.Zero;
+        var sessionPtr = IntPtr.Zero;
 
         Bitmap? result = null;
         Exception? capturedException = null;
-        int frameCount = 0;
 
-        // TryGetNextFrame is slot 7 on IDirect3D11CaptureFramePool
-        var tryGetNextFrame = GetVtMethod<VtTryGetNextFrameDelegate>(poolPtr, 7);
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        try
         {
-            int hr = tryGetNextFrame(poolPtr, out var framePtr);
-            if (hr < 0 || framePtr == IntPtr.Zero)
+            // Create capture item — returned pointer IS IGraphicsCaptureItem (default interface)
+            itemPtr = CreateCaptureItemForWindow(hwnd, log);
+
+            // get_Size is slot 7 on IGraphicsCaptureItem
+            var getSize = GetVtMethod<VtGetSizeDelegate>(itemPtr, 7);
+            Marshal.ThrowExceptionForHR(getSize(itemPtr, out var size));
+            log.LogDebug("WGC: item size={W}x{H}", size.Width, size.Height);
+
+            if (size.Width == 0 || size.Height == 0)
             {
-                Thread.Sleep(16);
-                continue;
+                log.LogWarning("WGC: zero size, aborting");
+                return null;
             }
 
-            frameCount++;
+            // Create free-threaded frame pool — returned pointer IS IDirect3D11CaptureFramePool
+            poolPtr = CreateFreeThreadedPool(devicePtr, size, log);
 
-            // framePtr IS IDirect3D11CaptureFrame (default interface)
-            // get_ContentSize is slot 8
-            var getContentSize = GetVtMethod<VtGetContentSizeDelegate>(framePtr, 8);
-            getContentSize(framePtr, out var contentSize);
-            log.LogDebug("WGC: frame #{N} size={W}x{H}", frameCount, contentSize.Width, contentSize.Height);
+            // CreateCaptureSession is slot 10 on IDirect3D11CaptureFramePool
+            var createSession = GetVtMethod<VtCreateCaptureSessionDelegate>(poolPtr, 10);
+            Marshal.ThrowExceptionForHR(createSession(poolPtr, itemPtr, out sessionPtr));
+            log.LogDebug("WGC: session created");
 
-            if (frameCount <= 1)
-            {
-                log.LogDebug("WGC: skipping first frame");
-                ComRelease(framePtr);
-                Thread.Sleep(50);
-                continue;
-            }
-
+            // Try disable border via IGraphicsCaptureSession3 (QI needed — different interface)
             try
             {
-                // get_Surface is slot 6 on IDirect3D11CaptureFrame
-                var getSurface = GetVtMethod<VtGetSurfaceDelegate>(framePtr, 6);
-                Marshal.ThrowExceptionForHR(getSurface(framePtr, out var surfacePtr));
-                result = SurfaceToBitmap(surfacePtr, d3dDevice, d3dContext, log);
-                ComRelease(surfacePtr);
-                log.LogDebug("WGC: bitmap {W}x{H}", result.Width, result.Height);
+                var session3 = ComQI(sessionPtr, IID_IGraphicsCaptureSession3);
+                var putBorder = GetVtMethod<VtPutBoolDelegate>(session3, 7);
+                putBorder(session3, 0);
+                ComRelease(session3);
+                log.LogDebug("WGC: border disabled");
             }
-            catch (Exception ex)
+            catch
             {
-                log.LogError(ex, "WGC: SurfaceToBitmap failed");
-                capturedException = ex;
+                log.LogDebug("WGC: border disable not supported");
             }
-            finally
+
+            // StartCapture is slot 6 on IGraphicsCaptureSession (default interface of session)
+            var startCapture = GetVtMethod<VtStartCaptureDelegate>(sessionPtr, 6);
+            Marshal.ThrowExceptionForHR(startCapture(sessionPtr));
+            log.LogDebug("WGC: capture started, polling for frames");
+
+            int frameCount = 0;
+
+            // TryGetNextFrame is slot 7 on IDirect3D11CaptureFramePool
+            var tryGetNextFrame = GetVtMethod<VtTryGetNextFrameDelegate>(poolPtr, 7);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
             {
-                ComRelease(framePtr);
+                int hr = tryGetNextFrame(poolPtr, out var framePtr);
+                if (hr < 0 || framePtr == IntPtr.Zero)
+                {
+                    Thread.Sleep(16);
+                    continue;
+                }
+
+                frameCount++;
+
+                // framePtr IS IDirect3D11CaptureFrame (default interface)
+                // get_ContentSize is slot 8
+                var getContentSize = GetVtMethod<VtGetContentSizeDelegate>(framePtr, 8);
+                getContentSize(framePtr, out var contentSize);
+                log.LogDebug("WGC: frame #{N} size={W}x{H}", frameCount, contentSize.Width, contentSize.Height);
+
+                if (frameCount <= 1)
+                {
+                    log.LogDebug("WGC: skipping first frame");
+                    ComCloseAndRelease(framePtr);
+                    Thread.Sleep(50);
+                    continue;
+                }
+
+                try
+                {
+                    // get_Surface is slot 6 on IDirect3D11CaptureFrame
+                    var getSurface = GetVtMethod<VtGetSurfaceDelegate>(framePtr, 6);
+                    Marshal.ThrowExceptionForHR(getSurface(framePtr, out var surfacePtr));
+                    try
+                    {
+                        result = SurfaceToBitmap(surfacePtr, d3dDevice, d3dContext, log);
+                        log.LogDebug("WGC: bitmap {W}x{H}", result.Width, result.Height);
+                    }
+                    finally
+                    {
+                        ComCloseAndRelease(surfacePtr);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.LogError(ex, "WGC: SurfaceToBitmap failed");
+                    capturedException = ex;
+                }
+                finally
+                {
+                    ComCloseAndRelease(framePtr);
+                }
+                break;
             }
-            break;
+
+            if (frameCount == 0)
+                log.LogWarning("WGC: no frames within timeout");
         }
-
-        if (frameCount == 0)
-            log.LogWarning("WGC: no frames within timeout");
-
-        // Cleanup
-        ComRelease(sessionPtr);
-        ComRelease(poolPtr);
-        ComRelease(itemPtr);
-        ComRelease(devicePtr);
+        finally
+        {
+            // Session and pool MUST be Closed, not just Released — see ComCloseAndRelease.
+            ComCloseAndRelease(sessionPtr);
+            ComCloseAndRelease(poolPtr);
+            ComRelease(itemPtr); // GraphicsCaptureItem has no IClosable
+            ComCloseAndRelease(devicePtr);
+        }
 
         if (capturedException != null)
             throw new InvalidOperationException("WGC frame processing failed.", capturedException);
