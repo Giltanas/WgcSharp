@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing.Imaging;
+using Microsoft.Extensions.Logging;
 using WgcSharp;
 
 Console.WriteLine("WgcSharp — Window Capture Demo");
@@ -33,7 +34,11 @@ if (hwnd == IntPtr.Zero)
 Console.WriteLine($"Found: {process.MainWindowTitle} (HWND: 0x{hwnd:X})");
 Console.WriteLine("Capturing...");
 
-var bitmap = WindowCapture.CaptureWindow(hwnd);
+// Optional: pass a logger to see detailed capture diagnostics
+using var loggerFactory = LoggerFactory.Create(b => b.AddConsole().SetMinimumLevel(LogLevel.Debug));
+var logger = loggerFactory.CreateLogger("WgcSharp");
+
+var bitmap = WindowCapture.CaptureWindow(hwnd, CaptureStrategy.Auto, timeoutMs: 2000, logger: logger);
 if (bitmap == null)
 {
     Console.WriteLine("Capture failed — returned null.");
@@ -41,7 +46,9 @@ if (bitmap == null)
 }
 
 var outputPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "capture.png");
+var width = bitmap.Width;
+var height = bitmap.Height;
 bitmap.Save(outputPath, ImageFormat.Png);
 bitmap.Dispose();
 
-Console.WriteLine($"Saved: {outputPath} ({bitmap.Width}x{bitmap.Height})");
+Console.WriteLine($"Saved: {outputPath} ({width}x{height})");
